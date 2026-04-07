@@ -1,0 +1,357 @@
+docker-file-----------------------------------------
+FROM nexus.dev.aws.singtel.com:38084/ubi8/openjdk-17-runtime:latest
+LABEL service=manage-service-qualification-co
+RUN mkdir -p /opt/manage-service-qualification-co &&\
+	mkdir -p /opt/dynatrace/paasInstaller_Unix_all_uat &&\
+	mkdir -p /opt/dynatrace/paasInstaller_Unix_all_prod
+COPY --chown=jboss:jboss "./target/*-SNAPSHOT.jar" "/opt/manage-service-qualification-co/manage-service-qualification-co.jar"
+COPY --chown=jboss:jboss "./entrypoint.sh" "/opt/manage-service-qualification-co/entrypoint.sh"
+COPY --chown=jboss:jboss "./paasInstaller_Unix_all_uat/" "/opt/dynatrace/paasInstaller_Unix_all_uat/"
+COPY --chown=jboss:jboss "./paasInstaller_Unix_all_prod/" "/opt/dynatrace/paasInstaller_Unix_all_prod/"
+RUN chmod +rx /opt/manage-service-qualification-co/manage-service-qualification-co.jar &&\
+    chmod +rx /opt/manage-service-qualification-co/entrypoint.sh
+ENTRYPOINT ["/opt/manage-service-qualification-co/entrypoint.sh"]
+
+entrypoint-------------------------
+
+#!/bin/bash
+export OPTIONS="-Djavax.net.ssl.trustStore=/config/wsfDeliveryCertificate.jks -Djavax.net.ssl.trustStorePassword=wsfdeliveryssl -Djavax.net.ssl.trustStoreType=JKS"
+if [[ "$env" == "pt" ]]
+then
+	#export ENV LD_PRELOAD="/opt/dynatrace/paasInstaller_Unix_all_uat/agent/lib64/liboneagentproc.so"
+	#sh -x /opt/dynatrace/paasInstaller_Unix_all_uat/dynatrace-agent64.sh
+	OPTIONS="-Djavax.net.ssl.trustStore=/config/wsfDeliveryCertificate.jks -Djavax.net.ssl.trustStorePassword=wsfdeliveryssl -Djavax.net.ssl.trustStoreType=JKS"	
+elif [[ "$env" == "prod" ]] || [[ "$env" == "dr" ]]
+then
+	export ENV LD_PRELOAD="/opt/dynatrace/paasInstaller_Unix_all_prod/agent/lib64/liboneagentproc.so"
+	sh -x /opt/dynatrace/paasInstaller_Unix_all_prod/dynatrace-agent64.sh
+	OPTIONS="-Djavax.net.ssl.trustStore=/config/jetty.ks -Djavax.net.ssl.trustStorePassword=sdpca2016 -Djavax.net.ssl.trustStoreType=JKS"
+fi
+
+java -Dspring.profiles.active=$env -Dspring.config.location=/config/manage-service-qualification-service-co.properties,/config/manage-service-qualification-service-auth.properties $OPTIONS -jar /opt/manage-service-qualification-co/manage-service-qualification-co.jar
+
+CI-task-plan configuration
+1.elastic agent build ------------------------------------------------------stage1-------------------------------------------------------------
+1.cleanup before run
+2.Checkout Default Repository
+3.script-setting.xml
+
+echo '<?xml version="1.0" encoding="UTF-8"?>
+<settings xmlns="http://maven.apache.org/SETTINGS/1.0.0"
+          xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+          xsi:schemaLocation="http://maven.apache.org/SETTINGS/1.0.0 http://maven.apache.org/xsd/settings-1.0.0.xsd">
+
+  <servers>
+    <server>
+      <id>singtel-digital-snapshots</id>
+      <username>${repo.username}</username>
+      <password>${repo.password}</password>
+    </server>
+    <server>
+      <id>singtel-digital-releases</id>
+      <username>${repo.username}</username>
+      <password>${repo.password}</password>
+    </server>
+    <server>
+      <id>central</id>
+      <username>${repo.username}</username>
+      <password>${repo.password}</password>
+    </server>
+  </servers>
+
+  <mirrors>
+    <mirror>
+      <id>central</id>
+      <name>central</name>
+      <url>https://nexus.dev.aws.singtel.com/repository/maven-public/</url>
+      <mirrorOf>*</mirrorOf>
+    </mirror>
+  </mirrors>
+   <profiles>
+		<profile>
+			<repositories>
+				<repository>
+					<id>central</id>
+					<name>libs-release</name>
+					<url>https://nexus.dev.aws.singtel.com/repository/maven-public/</url>
+				</repository>
+			</repositories>
+			<id>nexus</id>
+		</profile>
+	</profiles>
+	<activeProfiles>
+		<activeProfile>nexus</activeProfile>
+	</activeProfiles>  
+</settings>
+' > settings.xml
+
+4.script- get pom version
+
+export deploy_version_major=$(cat pom.xml|grep SNAPSHOT|cut -d ">" -f2|cut -d"-" -f1|cut -d"." -f1)
+export deploy_version_minor=$(cat pom.xml|grep SNAPSHOT|cut -d ">" -f2|cut -d"-" -f1|cut -d"." -f2)
+#export deploy_version=$(cat pom.xml|grep SNAPSHOT|cut -d ">" -f2|cut -d"-" -f1)
+echo "deploy_version_major=$deploy_version_major" > version.txt
+echo "deploy_version_minor=$deploy_version_minor" >> version.txt
+
+5.Inject Bamboo variables configuration  -versioning
+
+6. script set build version
+#!/bin/bash
+export JAVA_HOME="/usr/lib/jvm/jdk-17.0.4"
+mvn versions:set -DnewVersion=${bamboo_inject_deploy_version_major}.${bamboo_inject_deploy_version_minor}-${bamboo_buildNumber}-SNAPSHOT -f pom.xml -s settings.xml -Drepo.username="${bamboo_nexus_username}" -Drepo.password="${bamboo_nexus_password}"
+
+7.script-mvn clean verify
+#!/bin/bash
+export JAVA_HOME="/usr/lib/jvm/jdk-17.0.4"
+echo "JAVA_HOME=${JAVA_HOME}"
+mvn clean verify -U -s settings.xml \
+  -Drepo.username="${bamboo_nexus_username}"  \
+  -Drepo.password="${bamboo_nexus_password}" \
+  -Dmaven.wagon.http.ssl.insecure=true -Dmaven.wagon.http.ssl.allowall=true -Dmaven.wagon.http.ssl.ignore.validity.dates=true
+  
+   # -Dversion=${bamboo_deploy_version} \
+   
+8.script - IQ Policy Evaluation
+ApplicationID=$bamboo_appid
+java  -jar ~/nexus-iq-cli-latest.jar -i $ApplicationID -s "${bamboo_nexusiq_server}" -a "${bamboo_nexusiq_username}":"${bamboo_nexusiq_password}" target/*.jar
+
+9.script - NexusIQ publish artifact
+
+ApplicationID=$bamboo_appid
+APP_ID=`curl -u "${bamboo_nexusiq_username}":"${bamboo_nexusiq_password}" "${bamboo_nexusiq_server}"/api/v2/applications?publicId=$ApplicationID| jq -r '.applications[0].id'`
+REPORT_URL=`curl -u "${bamboo_nexusiq_username}":"${bamboo_nexusiq_password}" -k "${bamboo_nexusiq_server}"/api/v2/reports/applications/$APP_ID | jq -r '.[0].reportPdfUrl'`
+curl -u "${bamboo_nexusiq_username}":"${bamboo_nexusiq_password}" -kL "${bamboo_nexusiq_server}"/$REPORT_URL -o $ApplicationID.pdf
+
+10.script - sonar project properties
+
+echo '# must be unique in a given SonarQube instance
+sonar.projectKey=${bamboo.projectKey}
+sonar.branch.name=${bamboo.repository.git.branch}
+# --- optional properties ---
+
+# defaults to project key
+sonar.projectName=${bamboo.projectName}
+# defaults to not provided
+sonar.projectVersion=1.0
+
+sonar.host.url=https://sonarqube.pnd.prod.aws.sg.singtelgroup.net
+
+sonar.sources=src/main/java/
+sonar.java.binaries=target
+
+sonar.junit.reportPaths=target/surefire-reports
+sonar.surefire.reportPaths=target/surefire-reports
+sonar.jacoco.reportPaths=target/jacoco.exec,target/site/jacoco/
+sonar.tests=src/test/
+
+# Path is relative to the sonar-project.properties file. Defaults to .
+#sonar.sources=.
+
+# Encoding of the source code. Default is default system encoding
+#sonar.sourceEncoding=UTF-8' > sonar-project.properties
+
+11. script - Sonar Scanner
+
+#!/bin/bash
+sonar-scanner -X \
+    -Dsonar.projectKey=${bamboo_projectKey} \
+    -Dsonar.projectName=${bamboo_projectName} \
+    -Dsonar.host.url=https://sonarqube.pnd.prod.aws.sg.singtelgroup.net
+	
+12. script - Quality Gate Check
+
+#!/bin/bash
+
+set -e
+source ./.scannerwork/report-task.txt
+echo $ceTaskUrl
+echo $PATH
+
+i=0
+while (( $i < 10 ))
+do
+	analyze_report=$(curl $ceTaskUrl | jq '.task.status')
+	echo $analyze_report
+	if [ $analyze_report == "\"SUCCESS\"" ]
+	then
+	break
+	else
+	sleep 5s
+	i=$(( i+1 ))
+	fi
+done
+
+quality_gate=$(curl https://sonarqube.pnd.prod.aws.sg.singtelgroup.net/api/qualitygates/project_status?projectKey=$bamboo_projectKey | jq '.projectStatus.status')
+echo $quality_gate
+quality_gate_value=$(echo $quality_gate | sed "s/\"//g")
+echo $quality_gate_value
+if [ $quality_gate_value == "ERROR" ]
+then 
+exit -1
+else
+exit 0
+fi
+
+13. script - mvn deploy
+
+#!/bin/bash
+export JAVA_HOME="/usr/lib/jvm/jdk-17.0.4"
+echo "JAVA_HOME=${JAVA_HOME}"
+mvn deploy -s settings.xml \
+  -DgroupId=com.singtel.integration \
+  -DrepositoryId=singtel-digital-snapshots \
+  -Dmaven.test.skip=true \
+  -Durl=https://nexus.dev.aws.singtel.com/repository/maven-snapshots \
+  -Drepo.username="${bamboo_nexus_username}"  \
+  -Drepo.password="${bamboo_nexus_password}" \
+  -Dmaven.wagon.http.ssl.insecure=true -Dmaven.wagon.http.ssl.allowall=true -Dmaven.wagon.http.ssl.ignore.validity.dates=true
+  
+14. Repository Tag configuration - Repository Tag configuration
+${bamboo.buildResultKey}
+
+15.Script configuration -  dynatrace agent download
+
+curl -u "${bamboo_nexus_username}":"${bamboo_nexus_password}" https://nexus.dev.aws.singtel.com/repository/maven-releases/com/singtel/integration/paasInstaller_Unix_all_uat/"${bamboo.dynatrace_agent_version}"/paasInstaller_Unix_all_uat-"${bamboo.dynatrace_agent_version}".zip -o paasInstaller_Unix_all_uat.zip
+curl -u "${bamboo_nexus_username}":"${bamboo_nexus_password}" https://nexus.dev.aws.singtel.com/repository/maven-releases/com/singtel/integration/paasInstaller_Unix_all_prod/"${bamboo.dynatrace_agent_version}"/paasInstaller_Unix_all_prod-"${bamboo.dynatrace_agent_version}".zip -o paasInstaller_Unix_all_prod.zip
+
+
+15.JUnit Parser configuration - Junit Test parser
+ **/target/surefire-reports/*.xml
+ 
+ publish to nexus --------------------------------------------------------stage2-------------------------------------------------------------
+ 
+1.Clean working directory task configuration --  cleanup before run
+2.Artifact download configuration - pull the artifacts  - Integration - Customer Account › customer-account-co-upgraded
+3.Script configuration - settings.xml - 
+echo '<?xml version="1.0" encoding="UTF-8"?>
+<settings xmlns="http://maven.apache.org/SETTINGS/1.0.0"
+          xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+          xsi:schemaLocation="http://maven.apache.org/SETTINGS/1.0.0 http://maven.apache.org/xsd/settings-1.0.0.xsd">
+
+  <servers>
+    <server>
+      <id>singtel-digital-snapshots</id>
+      <username>${repo.username}</username>
+      <password>${repo.password}</password>
+    </server>
+    <server>
+      <id>singtel-digital-releases</id>
+      <username>${repo.username}</username>
+      <password>${repo.password}</password>
+    </server>
+    <server>
+      <id>central</id>
+      <username>${repo.username}</username>
+      <password>${repo.password}</password>
+    </server>
+  </servers>
+
+  <mirrors>
+    <mirror>
+      <id>central</id>
+      <name>central</name>
+      <url>http://nexus.dev.aws.singtel.com:8085/repository/maven-public/</url>
+      <mirrorOf>*</mirrorOf>
+    </mirror>
+  </mirrors>
+   <profiles>
+		<profile>
+			<repositories>
+				<repository>
+					<id>central</id>
+					<name>libs-release</name>
+					<url>http://nexus.dev.aws.singtel.com:8085/repository/maven-public/</url>
+				</repository>
+			</repositories>
+			<id>nexus</id>
+		</profile>
+	</profiles>
+	<activeProfiles>
+		<activeProfile>nexus</activeProfile>
+	</activeProfiles>  
+</settings>
+' > settings.xml
+
+4.Script configuration - get pom version
+
+export deploy_version_major=$(cat pom.xml|grep SNAPSHOT|cut -d ">" -f2|cut -d"-" -f1|cut -d"." -f1)
+export deploy_version_minor=$(cat pom.xml|grep SNAPSHOT|cut -d ">" -f2|cut -d"-" -f1|cut -d"." -f2)
+#export deploy_version=$(cat pom.xml|grep SNAPSHOT|cut -d ">" -f2|cut -d"-" -f1)
+echo "deploy_version_major=$deploy_version_major" > version.txt
+echo "deploy_version_minor=$deploy_version_minor" >> version.txt
+
+5.Inject Bamboo variables configuration - versioning
+6.Script configuration - ready dynatrace agent
+mkdir paasInstaller_Unix_all_uat
+
+unzip paasInstaller_Unix_all_uat.zip -d ./paasInstaller_Unix_all_uat/
+
+ 
+ls -lrt paasInstaller_Unix_all_uat/
+
+mkdir paasInstaller_Unix_all_prod
+
+unzip paasInstaller_Unix_all_prod.zip -d ./paasInstaller_Unix_all_prod/
+
+ 
+
+ls -lrt paasInstaller_Unix_all_prod/
+
+echo ""
+
+echo "======================== Dynatrace Versions ========================"
+
+echo ""
+
+echo "NON-PROD"
+
+echo ""
+
+cat paasInstaller_Unix_all_uat/agent/installer.version
+
+echo "PROD"
+
+cat paasInstaller_Unix_all_prod/agent/installer.version
+
+echo ""
+
+echo "======================== Dynatrace Versions ========================"
+
+
+
+7. Script configuration - podman build and push image to nexus
+
+#!/bin/sh
+nexus_tag="nexus.dev.aws.singtel.com:38081/csica-co:${bamboo_inject_deploy_version_major}.${bamboo_inject_deploy_version_minor}-${bamboo_buildNumber}"
+echo $nexus_tag
+env
+podman login nexus.dev.aws.singtel.com:38084 --username="${bamboo_onprem_nexus_username}" --password="${bamboo_onprem_nexus_password}" --tls-verify=false
+podman inspect nexus.dev.aws.singtel.com:38084/ubi8/openjdk-17:latest --format "{{.Labels.url}}"
+podman build -t $nexus_tag --no-cache .
+podman logout nexus.dev.aws.singtel.com:38084
+podman login nexus.dev.aws.singtel.com:38081 --username="${bamboo_onprem_nexus_username}" --password="${bamboo_onprem_nexus_password}" --tls-verify=false
+podman push $nexus_tag
+podman logout nexus.dev.aws.singtel.com:38081
+
+8.Script configuration - image cleanup
+
+nexus_tag="nexus.dev.aws.singtel.com:38081/csica-co:${bamboo_inject_deploy_version_major}.${bamboo_inject_deploy_version_minor}-${bamboo_buildNumber}"
+echo $nexus_tag
+podman rmi $nexus_tag
+
+fortify-------------------------------------stage3-----------------------------------------------------------
+
+1.Clean working directory task configuration - cleanup before run
+2.Source Code Checkout configuration - Check out source code
+3.Script configuration - Upload Fortify Reports
+
+/home/bamboo/Fortify/bin/sourceanalyzer -b "${bamboo_projectKey}" -clean
+/home/bamboo/Fortify/bin/sourceanalyzer -b "${bamboo_projectKey}" src/main/**
+/home/bamboo/Fortify/bin/sourceanalyzer -b "${bamboo_projectKey}" -scan -f results.fpr
+/home/bamboo/Fortify/bin/fortifyclient uploadFPR -url https://ssc-proxy.uat3.test.aws.singtel.com/ssc -authtoken "${bamboo_new_fortify_ssc_token_password}"  -file results.fpr -project "${bamboo_projectKey}" -version "1.0"
+/home/bamboo/Fortify/bin/BIRTReportGenerator -template "OWASP Top 10" -source results.fpr -output "${bamboo_projectKey}"-fortify-OWASPTop10-${bamboo_buildNumber}-report.pdf -format PDF -showSuppressed -Version "OWASP Top 10 2017"
+
+sleep 30
+
+/home/bamboo/Fortify/bin/BIRTReportGenerator -template "Developer Workbook" -source results.fpr -output "${bamboo_projectKey}"-fortify-Developer-${bamboo_buildNumber}-Workbook-report.pdf -format PDF -showSuppressed -Version "Developer Workbook"
+
